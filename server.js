@@ -27,7 +27,7 @@ const sseClients = new Map(); // sessionId -> Set of response objects
 // MIDDLEWARE
 // ============================================
 app.use(cors({
-    origin: ['https://bbq-chat-if.onrender.com/', 'http://localhost:3000', 'https://*.retool.com', 'http://localhost:5173'],
+    origin: ['https://bbq-chat-if.onrender.com/', 'http://localhost:3000',  'https://retool-edge.com', 'https://*.retool.com', 'http://localhost:5173'],
     credentials: true
 }));
 
