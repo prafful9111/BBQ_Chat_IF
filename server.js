@@ -513,11 +513,10 @@ app.post('/webhook/supabase', async (req, res) => {
             // Check if this might be a new session (first message)
             const { data: sessionMessages } = await supabase
                 .from('whatsapp_messages')
-                .select('w_msg_id')
-                .eq('session_id', record.session_id)
-                .limit(2);
+                .select('*', { count: 'exact', head: true })
+                .eq('session_id', record.session_id);
             
-            if (sessionMessages && sessionMessages.length === 1) {
+            if (count === 1) {
                 console.log(`🆕 New session created via webhook: ${record.session_id}`);
                 broadcastNewSession(record.session_id);
             }
