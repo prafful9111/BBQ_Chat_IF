@@ -7,7 +7,7 @@
 require('dotenv').config();
 
 // Import required libraries
-const express = require('express');
+const express = require('express');   
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 
@@ -22,6 +22,7 @@ const PORT = process.env.PORT || 8000;
 // ============================================
 // Store all connected SSE clients
 const sseClients = new Map(); // sessionId -> Set of response objects
+const sessionListClients = new Set(); // Clients listening for new sessions
 
 // ============================================
 // MIDDLEWARE
@@ -110,6 +111,37 @@ function broadcastToSession(sessionId, message) {
     }
 }
 
+// Session list SSE helper functions
+function addSessionListClient(res) {
+    sessionListClients.add(res);
+    console.log(`✅ Session list SSE client connected. Total clients: ${sessionListClients.size}`);
+}
+
+function removeSessionListClient(res) {
+    sessionListClients.delete(res);
+    console.log(`👋 Session list SSE client disconnected`);
+}
+
+function broadcastNewSession(sessionId) {
+    if (sessionListClients.size > 0) {
+        console.log(`📢 Broadcasting new session to ${sessionListClients.size} client(s): ${sessionId}`);
+        const data = JSON.stringify({
+            type: 'NEW_SESSION',
+            session_id: sessionId,
+            timestamp: new Date().toISOString()
+        });
+        
+        sessionListClients.forEach(client => {
+            try {
+                client.write(`data: ${data}\n\n`);
+            } catch (error) {
+                console.error('Error writing to session list SSE client:', error.message);
+                removeSessionListClient(client);
+            }
+        });
+    }
+}
+
 // ============================================
 // API ENDPOINTS
 // ============================================
@@ -119,9 +151,10 @@ app.get('/', (req, res) => {
     res.json({
         message: 'WhatsApp Message API with SSE is running!',
         status: 'healthy',
-        version: '2.0.0',
+        version: '2.1.0',
         sse_enabled: true,
         connected_sessions: Array.from(sseClients.keys()),
+        session_list_listeners: sessionListClients.size,
         endpoints: {
             health: 'GET /',
             testDB: 'GET /api/test',
@@ -129,6 +162,8 @@ app.get('/', (req, res) => {
             sendMessage: 'POST /api/messages',
             getMessage: 'GET /api/message/:messageId',
             sseStream: 'GET /api/sse/:sessionId',
+            sseSessionList: 'GET /api/sse/sessions',
+            getSessions: 'GET /api/sessions',
             webhook: 'POST /webhook/supabase'
         }
     });
@@ -157,6 +192,7 @@ app.get('/api/test', async (req, res) => {
             supabase_url: process.env.SUPABASE_URL,
             key_type: 'publishable_key',
             sse_active_sessions: Array.from(sseClients.keys()),
+            session_list_listeners: sessionListClients.size,
             timestamp: new Date().toISOString()
         });
         
@@ -205,7 +241,41 @@ app.get('/api/sse/:sessionId', (req, res) => {
     });
 });
 
-// 4. GET ALL MESSAGES FOR A SESSION
+// 4. SSE ENDPOINT - Real-time updates for new sessions
+app.get('/api/sse/sessions', (req, res) => {
+    console.log(`🌊 SSE connection request for session list`);
+    
+    // Set headers for SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ type: 'connected' })}\n\n`);
+    
+    // Add this client to session list listeners
+    addSessionListClient(res);
+    
+    // Send heartbeat every 30 seconds
+    const heartbeat = setInterval(() => {
+        try {
+            res.write(`:heartbeat\n\n`);
+        } catch (error) {
+            clearInterval(heartbeat);
+            removeSessionListClient(res);
+        }
+    }, 30000);
+    
+    // Clean up on disconnect
+    req.on('close', () => {
+        clearInterval(heartbeat);
+        removeSessionListClient(res);
+        console.log(`🔌 Session list SSE connection closed`);
+    });
+});
+
+// 5. GET ALL MESSAGES FOR A SESSION
 app.get('/api/messages/:sessionId', async (req, res) => {
     const sessionId = req.params.sessionId;
     console.log(`📥 Getting messages for session: "${sessionId}"`);
@@ -243,7 +313,7 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     }
 });
 
-// 5. SEND A NEW MESSAGE
+// 6. SEND A NEW MESSAGE
 app.post('/api/messages', async (req, res) => {
     console.log('📤 Received new message request');
     console.log('Body:', JSON.stringify(req.body, null, 2));
@@ -264,6 +334,16 @@ app.post('/api/messages', async (req, res) => {
         
         console.log(`💬 New message from ${sender_id} to ${recipient_id}: "${message_text.substring(0, 50)}${message_text.length > 50 ? '...' : ''}"`);
         
+        // Check if this is a new session (before inserting the message)
+        const { data: existingSession, error: sessionCheckError } = await supabase
+            .from('whatsapp_messages')
+            .select('session_id')
+            .eq('session_id', session_id)
+            .limit(1);
+        
+        const isNewSession = !existingSession || existingSession.length === 0;
+        
+        // Insert the message
         const { data, error } = await supabase
             .from('whatsapp_messages')
             .insert([{
@@ -285,6 +365,12 @@ app.post('/api/messages', async (req, res) => {
         
         console.log(`✅ Message saved! ID: ${data.w_msg_id}`);
         
+        // If this is a new session, broadcast it
+        if (isNewSession) {
+            console.log(`🆕 New session detected: ${session_id}`);
+            broadcastNewSession(session_id);
+        }
+        
         // Broadcast to SSE clients (in case webhook is slow or fails)
         broadcastToSession(session_id, {
             type: 'NEW_MESSAGE',
@@ -298,6 +384,7 @@ app.post('/api/messages', async (req, res) => {
             session_id: data.session_id,
             sender_id: data.sender_id,
             timestamp: data.timestamp,
+            is_new_session: isNewSession,
             data: data
         });
         
@@ -326,7 +413,7 @@ app.post('/api/messages', async (req, res) => {
     }
 });
 
-// 6. GET A SPECIFIC MESSAGE BY ID
+// 7. GET A SPECIFIC MESSAGE BY ID
 app.get('/api/message/:messageId', async (req, res) => {
     const messageId = req.params.messageId;
     console.log(`🔍 Looking for message with ID: ${messageId}`);
@@ -371,7 +458,7 @@ app.get('/api/message/:messageId', async (req, res) => {
     }
 });
 
-// 7. GET ALL SESSIONS
+// 8. GET ALL SESSIONS
 app.get('/api/sessions', async (req, res) => {
     console.log('📋 Getting all unique sessions...');
     
@@ -391,7 +478,8 @@ app.get('/api/sessions', async (req, res) => {
             success: true,
             count: uniqueSessions.length,
             sessions: uniqueSessions,
-            active_sse_sessions: Array.from(sseClients.keys())
+            active_sse_sessions: Array.from(sseClients.keys()),
+            session_list_listeners: sessionListClients.size
         });
         
     } catch (error) {
@@ -422,6 +510,18 @@ app.post('/webhook/supabase', async (req, res) => {
         if (table === 'whatsapp_messages' && type === 'INSERT') {
             console.log(`✅ New message inserted for session: ${record.session_id}`);
             
+            // Check if this might be a new session (first message)
+            const { data: sessionMessages } = await supabase
+                .from('whatsapp_messages')
+                .select('w_msg_id')
+                .eq('session_id', record.session_id)
+                .limit(2);
+            
+            if (sessionMessages && sessionMessages.length === 1) {
+                console.log(`🆕 New session created via webhook: ${record.session_id}`);
+                broadcastNewSession(record.session_id);
+            }
+            
             // Broadcast to all SSE clients listening to this session
             broadcastToSession(record.session_id, {
                 type: 'NEW_MESSAGE',
@@ -449,6 +549,7 @@ app.use((req, res) => {
             'GET  /',
             'GET  /api/test',
             'GET  /api/sse/:sessionId',
+            'GET  /api/sse/sessions',
             'GET  /api/messages/:sessionId',
             'POST /api/messages',
             'GET  /api/message/:messageId',
@@ -471,11 +572,13 @@ app.listen(PORT, () => {
     console.log(`🔗 Supabase: ${process.env.SUPABASE_URL}`);
     console.log(`📝 Key type: Publishable key`);
     console.log(`🌊 SSE Support: ENABLED`);
+    console.log(`🆕 Session SSE: ENABLED`);
     console.log('='.repeat(50));
     console.log('\n📌 AVAILABLE ENDPOINTS:');
     console.log('   GET  /                     - Health check');
     console.log('   GET  /api/test            - Test database connection');
     console.log('   GET  /api/sse/:sessionId  - SSE stream for real-time updates');
+    console.log('   GET  /api/sse/sessions    - SSE stream for new sessions');
     console.log('   GET  /api/messages/:id    - Get messages for a session');
     console.log('   POST /api/messages        - Send new message');
     console.log('   GET  /api/message/:id     - Get specific message');
@@ -497,5 +600,14 @@ process.on('SIGINT', () => {
         });
     });
     sseClients.clear();
+    
+    // Close session list SSE connections
+    sessionListClients.forEach(client => {
+        try {
+            client.end();
+        } catch (e) {}
+    });
+    sessionListClients.clear();
+    
     process.exit(0);
 });
