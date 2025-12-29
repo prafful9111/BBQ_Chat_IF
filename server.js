@@ -313,6 +313,40 @@ app.get('/api/messages/:sessionId', async (req, res) => {
     }
 });
 
+// 5.1 GET FINAL BOOKING DETAILS FOR A SESSION
+app.get('/api/session-details/:sessionId', async (req, res) => {
+    const { sessionId } = req.params;
+    console.log(`📋 Fetching booking details for session: ${sessionId}`);
+
+    try {
+        const { data, error } = await supabase
+            .from('whatsapp_messages')
+            .select('final_booking_details')
+            .eq('session_id', sessionId)
+            .not('final_booking_details', 'is', null)
+            .order('timestamp', { ascending: false })
+            .limit(1)
+            .single();
+
+        if (error && error.code !== 'PGRST116') {
+            throw error;
+        }
+
+        res.json({
+            success: true,
+            session_id: sessionId,
+            final_booking_details: data?.final_booking_details || null
+        });
+
+    } catch (error) {
+        console.error('❌ Error fetching booking details:', error.message);
+        res.status(500).json({
+            success: false,
+            error: error.message
+        });
+    }
+});
+
 // 6. SEND A NEW MESSAGE
 app.post('/api/messages', async (req, res) => {
     console.log('📤 Received new message request');
